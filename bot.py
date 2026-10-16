@@ -88,7 +88,7 @@ WITHDRAW_STREET = "Niketon House (24/7)"
 EXPECTED_CURRENCY_ID = None
 
 SUPPORT_USERNAME = "@depositeandwithdrawal_service"
-SUPPORT_LINK = "https://t.me/depositeandwithdrawalservice"
+SUPPORT_LINK = "https://t.me/depositeandwithdrawal_service"
 PROMO_CODE = "diposite19"
 
 SUPPORT_MESSAGE = (
@@ -1487,7 +1487,7 @@ async def send_welcome_notice(update, context):
         "👉 @onexbbbot 👍👍 (রোবট)\n"
         "         👆👆👆👆👆\n"
         "    **৫ সেকেন্ডে ডিপোজিট | উইথড্র**\n\n"
-        f"📣 💬 সার্বিক সহযোগিতার জন্য: প্রথমে আমাদের অফিসিয়াল সাপোর্ট গ্রুপ বা চ্যানেলে মেসেজ করুন 👉 {SUPPORT_USERNAME}\n\n"
+        f"📣 💬 সার্বিক সহযোগিতার জন্য: প্রথমে আমাদের অফিসিয়াল সাপোর্ট গ্রুপ বা চ্যানেলে মেসেজ করুন 👉 @depositeandwithdrawal_service\n\n"
         "📍 **ডিপোজিট বা উইথড্র করতে START বা নিচের বাটন চাপুন**\n"
         "💬 **২৪/৭ সাপোর্ট অ্যাক্টিভ**\n\n"
         "ধন্যবাদ 🙏✅"
