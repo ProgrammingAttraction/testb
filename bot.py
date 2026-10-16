@@ -59,7 +59,7 @@ CALLBACK_HOST = os.getenv("CALLBACK_HOST", "0.0.0.0")
 CALLBACK_PORT = int(os.getenv("PORT") or os.getenv("CALLBACK_PORT", "8080"))
 CALLBACK_PATH = os.getenv("CALLBACK_PATH", "/api/callback")
 
-_default_callback = f"http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}"
+_default_callback = f"https://testb-1-40ew.onrender.com{CALLBACK_PATH}"
 MERCHANT_CALLBACK_URL = os.getenv("MERCHANT_CALLBACK_URL", _default_callback)
 
 SHOP_USER_LONG_ID = "01b14c7c-b69d-4fe2-8549-ba7f438499d5"
