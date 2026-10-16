@@ -87,7 +87,7 @@ WITHDRAW_CITY = "Madhabdi"
 WITHDRAW_STREET = "Niketon House (24/7)"
 EXPECTED_CURRENCY_ID = None
 
-SUPPORT_USERNAME = "@depositeandwithdrawalservice"
+SUPPORT_USERNAME = "@depositeandwithdrawal_service"
 SUPPORT_LINK = "https://t.me/depositeandwithdrawalservice"
 PROMO_CODE = "diposite19"
 
