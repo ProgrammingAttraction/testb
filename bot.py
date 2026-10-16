@@ -5,11 +5,15 @@ import logging
 import os
 import random
 import string
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
+
 import requests
+from flask import Flask, request, jsonify
+
 from telegram import (
     BotCommand,
     ForceReply,
@@ -48,16 +52,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8667126682:AAFVPgUv_HZJYUegKAP0GgGM-hrc8NMI3
 # Merchant API (deposit)
 ORDER_API_URL = "https://asmm.worldxxpp.com/api/createOrder"
 INQUIRY_ORDER_API_URL = "https://asmm.worldxxpp.com/api/inquiryOrder"
-
-# Merchant API (withdrawal)
 PAYMENT_ORDER_API_URL = "https://asmm.worldxxpp.com/api/createPaymentOrder"
 
-# Deposit merchant credentials
+# ✅ Callback endpoint configuration
+CALLBACK_HOST = os.getenv("CALLBACK_HOST", "0.0.0.0")
+CALLBACK_PORT = int(os.getenv("PORT") or os.getenv("CALLBACK_PORT", "8080"))
+CALLBACK_PATH = os.getenv("CALLBACK_PATH", "/api/callback")
+
+_default_callback = f"http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}"
+MERCHANT_CALLBACK_URL = os.getenv("MERCHANT_CALLBACK_URL", _default_callback)
+
 SHOP_USER_LONG_ID = "01b14c7c-b69d-4fe2-8549-ba7f438499d5"
 MERCHANT_HASH_KEY = os.getenv("MERCHANT_HASH_KEY", "cElRZclKYLhMWk1AzGFn4gzbmnqTas1A")
-MERCHANT_CALLBACK_URL = os.getenv("MERCHANT_CALLBACK_URL", "https://www.google.com")
 
-# Withdrawal (payout) merchant credentials
 PAYOUT_HASH_KEY = os.getenv("PAYOUT_HASH_KEY", "ZWAgcTCqps508bOokQFgHMrcdObAhmY9")
 PAYOUT_SHOP_USER_LONG_ID = os.getenv(
     "PAYOUT_SHOP_USER_LONG_ID", "70048cf0-3401-4f4d-a0bc-6dcfd7a54a37"
@@ -68,7 +75,7 @@ WITHDRAW_CHANNELS = [
     (35, "নগদ", "🧡"),
     (46, "রকেট", "💜"),
 ]
-WITHDRAW_CURRENCY_ID = 11  # BDT
+WITHDRAW_CURRENCY_ID = 11
 
 DEFAULT_PAYEE_ACCOUNT_NAME = os.getenv("PAYEE_ACCOUNT_NAME", "ASMPAY")
 DEFAULT_PAYEE_PHONE_NUMBER = os.getenv("PAYEE_PHONE_NUMBER", "01700000000")
@@ -79,6 +86,15 @@ TXN_EXAMPLE_IMAGE = "https://i.ibb.co/T6NZ3Yw/photo-2026-10-05-20-56-36.jpg"
 WITHDRAW_CITY = "Madhabdi"
 WITHDRAW_STREET = "Niketon House (24/7)"
 EXPECTED_CURRENCY_ID = None
+
+SUPPORT_USERNAME = "@depositeandwithdrawalservice"
+SUPPORT_LINK = "https://t.me/depositeandwithdrawalservice"
+PROMO_CODE = "diposite19"
+
+SUPPORT_MESSAGE = (
+    "📣 💬 সার্বিক সহযোগিতার জন্য: প্রথমে আমাদের অফিসিয়াল সাপোর্ট গ্রুপ "
+    f"বা চ্যানেলে মেসেজ করুন 👉 {SUPPORT_USERNAME}"
+)
 
 ADMIN_USER_IDS = set(
     x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
@@ -120,6 +136,26 @@ PAYOUT_ERROR_TEXT_BN = {
     "истек": "উইথড্র কোডটির মেয়াদ শেষ হয়ে গেছে।",
 }
 
+PAYMENT_ORDER_ERROR_BN = {
+    "PaymentChannelClosed": "❌ এই পেমেন্ট চ্যানেলটি এখন বন্ধ আছে।",
+    "InsufficientBalance": "❌ আমাদের একাউন্টে পর্যাপ্ত ব্যালেন্স নেই।",
+    "TryAgainLater": "⚠️ সিস্টেম এখন ব্যস্ত। একটু পরে চেষ্টা করুন।",
+    "DevError": "❌ সিস্টেমে সমস্যা হয়েছে।",
+    "PairingFailed": "❌ এই চ্যানেলটি এই মুহূর্তে কাজ করছে না।",
+    "CheckIpAddressFailed": "❌ IP যাচাই ব্যর্থ হয়েছে।",
+    "CheckEncryptValueFailed": "❌ এনক্রিপশন যাচাই ব্যর্থ হয়েছে।",
+    "NoPayeeAccountName": "❌ পেউআউট নম্বর সঠিক নয়।",
+}
+
+PAYMENT_ORDER_ERROR_TEXT_BN = {
+    "channel closed": "❌ এই পেমেন্ট চ্যানেলটি এখন বন্ধ আছে।",
+    "insufficient": "❌ আমাদের একাউন্টে পর্যাপ্ত ব্যালেন্স নেই।",
+    "try again later": "⚠️ সিস্টেম এখন ব্যস্ত। একটু পরে চেষ্টা করুন।",
+    "busy": "⚠️ সিস্টেম এখন ব্যস্ত। একটু পরে চেষ্টা করুন।",
+    "pairing": "❌ এই চ্যানেলটি এই মুহূর্তে কাজ করছে না।",
+    "unavailable": "❌ এই চ্যানেলটি এই মুহূর্তে কাজ করছে না।",
+}
+
 
 def translate_payout_error(message: str, message_id) -> str:
     if message_id is not None:
@@ -139,6 +175,22 @@ def translate_payout_error(message: str, message_id) -> str:
             return f"❌ {bn_val}"
 
     return f"❌ উইথড্র ব্যর্থ: `{message}`"
+
+
+def translate_payment_order_error(message: str) -> str:
+    if not isinstance(message, str):
+        return "❌ এই পেমেন্ট চ্যানেলটি এই মুহূর্তে কাজ করছে না। অন্য চ্যানেল বেছে নিন।"
+
+    for key, val in PAYMENT_ORDER_ERROR_BN.items():
+        if key in message:
+            return val
+
+    lower = message.lower()
+    for key, val in PAYMENT_ORDER_ERROR_TEXT_BN.items():
+        if key in lower:
+            return val
+
+    return "❌ এই পেমেন্ট চ্যানেলটি এই মুহূর্তে কাজ করছে না।"
 
 
 # --- 2. HELPERS ---
@@ -186,6 +238,447 @@ def generate_encrypt_value(params, hash_key):
     kv_pairs.append(f"HashKey={hash_key.strip()}")
     raw_string = "&".join(kv_pairs).lower()
     return hashlib.sha256(raw_string.encode("utf-8")).hexdigest().upper()
+
+
+# =========================================================================
+# --- 2.5 SHOP ORDER ID ENCODE / DECODE ---
+# =========================================================================
+def make_shop_order_id(player_id):
+    """
+    Encode player ID inside ShopOrderId.
+    Format: ORD-{player_id}-{unix_ts}-{4hex}
+    Example: ORD-1355931989-1760621259-a1b2
+    """
+    ts = int(datetime.now().timestamp())
+    rand4 = "".join(random.choices("0123456789abcdef", k=4))
+    return f"ORD-{player_id}-{ts}-{rand4}"
+
+
+def extract_player_id_from_shop_order_id(shop_order_id):
+    """
+    Extract player ID from ShopOrderId.
+    Handles both:
+      - "ORD-{player_id}-{ts}-{rand4}"  (our new format)
+      - "ORD-{ts}-{rand4}"              (old format → returns None)
+    """
+    if not shop_order_id:
+        return None
+    s = str(shop_order_id).strip()
+    parts = s.split("-")
+    # New format: ORD-<playerid>-<ts>-<rand4> → 4 parts, parts[1] is numeric
+    if len(parts) >= 4 and parts[0].upper() == "ORD" and parts[1].isdigit():
+        return parts[1]
+    # Some merchants may uppercase things; try case-insensitive
+    if len(parts) >= 4 and parts[0].upper() == "ORD":
+        # If parts[1] is not digit but parts[2] is, it's old format
+        if parts[2].isdigit():
+            # Old format: ORD-{ts}-{rand4}
+            return None
+    return None
+
+
+# =========================================================================
+# --- 2.6 PENDING DEPOSIT REGISTRY (kept as backup) ---
+# =========================================================================
+pending_deposits_lock = threading.Lock()
+pending_deposits = {}
+
+
+def register_pending_deposit(shop_order_id, chat_id, user_id, name, amount, wallet, trxid):
+    with pending_deposits_lock:
+        pending_deposits[shop_order_id] = {
+            "chat_id": chat_id,
+            "user_id": str(user_id),
+            "name": name,
+            "amount": int(amount),
+            "wallet": wallet,
+            "trxid": trxid,
+            "notified": False,
+        }
+    logger.info(f"[PENDING] registered {shop_order_id} for user {user_id} amount {amount}")
+
+
+def pop_pending_deposit(shop_order_id):
+    with pending_deposits_lock:
+        return pending_deposits.pop(shop_order_id, None)
+
+
+def peek_pending_deposit(shop_order_id):
+    with pending_deposits_lock:
+        return pending_deposits.get(shop_order_id)
+
+
+# =========================================================================
+# --- 2.7 CALLBACK HTTP SERVER (Flask) ---
+# =========================================================================
+flask_app = Flask(__name__)
+telegram_app = None
+
+
+def _notify_user_via_telegram(chat_id, text):
+    if telegram_app is None:
+        logger.warning("[CALLBACK] telegram_app not set; cannot notify user.")
+        return
+    try:
+        loop = telegram_app.loop
+        if loop is None or loop.is_closed():
+            logger.warning("[CALLBACK] event loop not available.")
+            return
+        coro = telegram_app.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="Markdown"
+        )
+        asyncio.run_coroutine_threadsafe(coro, loop)
+    except Exception as e:
+        logger.error(f"[CALLBACK] failed to send telegram message: {e}")
+
+
+def _process_callback_payload(payload: dict, raw_text: str, remote_addr: str):
+    """
+    Credit engine.
+
+    Priority order:
+      1. Pending deposit registry (matches ShopOrderId) — gives us chat_id + wallet + trxid.
+      2. Extract player ID from ShopOrderId (our new format) — credit the player.
+    """
+    if not isinstance(payload, dict):
+        logger.warning("[CALLBACK] payload is not dict; skipping credit logic")
+        return
+
+    shop_order_id = (
+        payload.get("ShopOrderId")
+        or payload.get("shopOrderId")
+        or payload.get("shop_order_id")
+    )
+    if not shop_order_id:
+        logger.warning("[CALLBACK] no ShopOrderId in payload; skipping credit logic")
+        return
+
+    shop_order_id = str(shop_order_id)
+
+    # ---- Try pending deposit first (best case: we have full info) ----
+    pending = peek_pending_deposit(shop_order_id)
+
+    # ---- Otherwise, extract player ID from ShopOrderId itself ----
+    if not pending:
+        extracted_player_id = extract_player_id_from_shop_order_id(shop_order_id)
+
+        if extracted_player_id:
+            logger.info(
+                f"[CALLBACK] no pending deposit for {shop_order_id}; "
+                f"extracted player_id={extracted_player_id} from ShopOrderId"
+            )
+
+            try:
+                amount_from_cb = int(
+                    payload.get("Amount")
+                    or payload.get("amount")
+                    or payload.get("RealAmount")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                amount_from_cb = 0
+
+            if amount_from_cb <= 0:
+                logger.warning("[CALLBACK] extracted amount is 0; skipping")
+                return
+
+            pending = {
+                "chat_id": 0,  # unknown — will skip Telegram notification
+                "user_id": str(extracted_player_id),
+                "name": "Player",  # will try to fetch real name below
+                "amount": amount_from_cb,
+                "wallet": "N/A",
+                "trxid": payload.get("TrackingNumber") or "N/A",
+                "notified": False,
+            }
+
+            # Optionally look up the player name for a nicer message
+            try:
+                u = api_search_user(extracted_player_id)
+                if isinstance(u, dict) and u.get("name"):
+                    pending["name"] = u["name"]
+            except Exception:
+                pass
+        else:
+            logger.warning(
+                f"[CALLBACK] no pending deposit for {shop_order_id}; "
+                f"could not extract player ID from ShopOrderId"
+            )
+            return
+
+    if pending.get("notified"):
+        logger.info(f"[CALLBACK] {shop_order_id} already processed; skipping")
+        return
+
+    amount = int(pending.get("amount") or 0)
+    user_id = str(pending.get("user_id") or "")
+    name = pending.get("name") or "Guest User"
+    chat_id = pending.get("chat_id")
+    wallet = pending.get("wallet") or "N/A"
+    trxid = pending.get("trxid") or "N/A"
+
+    try:
+        merchant_amount = int(
+            payload.get("Amount")
+            or payload.get("amount")
+            or payload.get("RealAmount")
+            or amount
+        )
+    except (TypeError, ValueError):
+        merchant_amount = amount
+
+    status_id = payload.get("OrderStatusId", payload.get("orderStatusId"))
+
+    print("\n" + "-" * 78)
+    print(f"🧠 [CREDIT ENGINE] shop_order_id={shop_order_id}")
+    print(f"                    user_id={user_id}  amount={amount}")
+    print(f"                    merchant_amount={merchant_amount}  status_id={status_id}")
+    print("-" * 78)
+
+    try:
+        if status_id is not None and int(status_id) not in (2, 1):
+            logger.info(f"[CALLBACK] status_id={status_id} not a paid status; skipping")
+            return
+    except (TypeError, ValueError):
+        pass
+
+    # Mark as notified to prevent duplicate processing
+    with pending_deposits_lock:
+        if shop_order_id in pending_deposits:
+            pending_deposits[shop_order_id]["notified"] = True
+
+    # Call api_deposit_add
+    try:
+        add_res = api_deposit_add(user_id, amount)
+    except Exception as e:
+        add_res = {"success": False, "message": f"Exception: {e}"}
+
+    add_ok = bool(add_res.get("success"))
+    dup = bool(add_res.get("duplicate_guard"))
+    withdrawal_blocked = bool(add_res.get("withdrawal_blocked"))
+    add_msg = add_res.get("message") or ""
+    add_summa = add_res.get("summa")
+
+    print(f"💰 [CREDIT ENGINE] add_ok={add_ok} dup={dup} blocked={withdrawal_blocked} msg={add_msg}")
+
+    if add_ok:
+        final_text = (
+            f"✅ **ডিপোজিট সফল!**\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"👤 **প্লেয়ার আইডি:** `{user_id}`\n"
+            f"📝 **নাম:** {name}\n"
+            f"💳 **মেথড:** {wallet}\n"
+            f"🆔 **ট্রানজেকশন আইডি:** `{trxid}`\n"
+            f"💵 **অ্যামাউন্ট:** `{add_summa if add_summa is not None else amount}` BDT\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"⏱️ ফান্ড অ্যাড হয়ে গেছে ✅"
+        )
+    elif dup:
+        final_text = (
+            f"✅ **ডিপোজিট সফল!** _(already credited)_\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"👤 **প্লেয়ার আইডি:** `{user_id}`\n"
+            f"💵 **অ্যামাউন্ট:** `{amount}` BDT\n"
+            f"🆔 **ট্রানজেকশন আইডি:** `{trxid}`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"ℹ️ এই ডিপোজিট আগেই অ্যাড হয়েছে।"
+        )
+    elif withdrawal_blocked:
+        final_text = (
+            f"⚠️ **ডিপোজিট এখন করা যাচ্ছে না!**\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"👤 **প্লেয়ার আইডি:** `{user_id}`\n"
+            f"💵 **অ্যামাউন্ট:** `{amount}` BDT\n"
+            f"🆔 **ট্রানজেকশন আইডি:** `{trxid}`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"📌 **কারণ:** আপনার একাউন্টে কিছু কনফার্মড উইথড্র রিকোয়েস্ট বাকি আছে।\n\n"
+            f"💡 **সমাধান:**\n"
+            f"১️⃣ 1xBet একাউন্টে লগইন করুন\n"
+            f"২️⃣ উইথড্র রিকোয়েস্ট সম্পূর্ণ / ক্যান্সেল করুন\n"
+            f"৩️⃣ তারপর আবার ডিপোজিট করুন\n\n"
+            f"📞 সহায়তার জন্য যোগাযোগ করুন: {SUPPORT_USERNAME}"
+        )
+    else:
+        final_text = (
+            f"❌ **ফান্ড অ্যাড ব্যর্থ!**\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"👤 **প্লেয়ার আইডি:** `{user_id}`\n"
+            f"💵 **অ্যামাউন্ট:** `{amount}` BDT\n"
+            f"🆔 **ট্রানজেকশন আইডি:** `{trxid}`\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"➤ কারণ: `{add_msg or 'Unknown error'}`\n\n"
+            f"📞 সাপোর্টে যোগাযোগ করুন ({SUPPORT_USERNAME})।"
+        )
+
+    if chat_id and chat_id != 0:
+        _notify_user_via_telegram(chat_id, final_text)
+
+    pop_pending_deposit(shop_order_id)
+
+
+@flask_app.route(CALLBACK_PATH, methods=["POST", "GET"])
+def merchant_callback():
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    print("\n" + "=" * 78)
+    print(f"📩 [CALLBACK RECEIVED] {ts} UTC")
+    print("=" * 78)
+    print(f"Method        : {request.method}")
+    print(f"Remote Addr   : {request.remote_addr}")
+    print(f"Full Path     : {request.full_path}")
+    print(f"URL           : {request.url}")
+
+    print("\n--- Headers ---")
+    for k, v in request.headers.items():
+        print(f"  {k}: {v}")
+
+    print("\n--- Query Params ---")
+    if request.args:
+        for k, v in request.args.items():
+            print(f"  {k} = {v}")
+    else:
+        print("  (none)")
+
+    print("\n--- Form Data ---")
+    if request.form:
+        for k, v in request.form.items():
+            print(f"  {k} = {v}")
+    else:
+        print("  (none)")
+
+    print("\n--- Raw Body ---")
+    try:
+        raw = request.get_data(as_text=True)
+        print(raw if raw else "(empty)")
+    except Exception as e:
+        raw = ""
+        print(f"(error reading body: {e})")
+
+    parsed_json = None
+    try:
+        parsed_json = request.get_json(silent=True)
+    except Exception:
+        parsed_json = None
+
+    print("\n--- Parsed JSON (if any) ---")
+    if parsed_json is not None:
+        print(format_json(parsed_json))
+    else:
+        print("  (not JSON or empty)")
+
+    if parsed_json is None and raw:
+        try:
+            parsed_json = json.loads(raw)
+            print("\n--- Parsed JSON (from raw) ---")
+            print(format_json(parsed_json))
+        except Exception:
+            pass
+
+    if isinstance(parsed_json, dict):
+        for key in (
+            "ShopOrderId", "shopOrderId",
+            "OrderTrackingNumber",
+            "Status", "status",
+            "Amount", "amount",
+            "Success", "success",
+            "TransferCode", "transferCode",
+        ):
+            if key in parsed_json:
+                print(f"➤ {key}: {parsed_json[key]}")
+
+    print("=" * 78 + "\n")
+
+    logger.info(
+        f"[CALLBACK] {request.method} {request.full_path} "
+        f"from {request.remote_addr} body={raw[:300]}"
+    )
+
+    try:
+        _process_callback_payload(parsed_json, raw, request.remote_addr)
+    except Exception as e:
+        logger.error(f"[CALLBACK] credit processing failed: {e}")
+
+    return jsonify({"Success": True, "Message": "Callback received"}), 200
+
+
+@flask_app.route("/api/debug/register", methods=["POST"])
+def debug_register_pending():
+    data = request.get_json(silent=True) or {}
+
+    shop_order_id = data.get("ShopOrderId")
+    chat_id = data.get("ChatId")
+    user_id = data.get("UserId")
+    name = data.get("Name", "Guest User")
+    amount = data.get("Amount")
+    wallet = data.get("Wallet", "বিকাশ")
+    trxid = data.get("TrxId", "TEST")
+
+    if not shop_order_id or not chat_id or not user_id or not amount:
+        return jsonify({
+            "Success": False,
+            "Message": "ShopOrderId, ChatId, UserId, and Amount are required"
+        }), 400
+
+    try:
+        amount = int(amount)
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return jsonify({"Success": False, "Message": "Amount and ChatId must be numbers"}), 400
+
+    register_pending_deposit(
+        shop_order_id=str(shop_order_id),
+        chat_id=chat_id,
+        user_id=str(user_id),
+        name=str(name),
+        amount=amount,
+        wallet=str(wallet),
+        trxid=str(trxid),
+    )
+
+    return jsonify({
+        "Success": True,
+        "ShopOrderId": shop_order_id,
+        "Message": "Pending deposit registered"
+    }), 200
+
+
+@flask_app.route("/api/debug/pending", methods=["GET"])
+def debug_list_pending():
+    with pending_deposits_lock:
+        keys = list(pending_deposits.keys())
+        return jsonify({"count": len(keys), "shop_order_ids": keys}), 200
+
+
+@flask_app.route("/api/debug/pending/clear", methods=["POST"])
+def debug_clear_pending():
+    with pending_deposits_lock:
+        n = len(pending_deposits)
+        pending_deposits.clear()
+    return jsonify({"Success": True, "Cleared": n}), 200
+
+
+@flask_app.route("/", methods=["GET"])
+def _health():
+    return jsonify({"status": "ok", "callback": CALLBACK_PATH}), 200
+
+
+def start_flask_in_background():
+    def _run():
+        try:
+            print(f"🌐 Callback server listening on http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}")
+            flask_app.run(
+                host=CALLBACK_HOST,
+                port=CALLBACK_PORT,
+                debug=False,
+                use_reloader=False,
+                threaded=True,
+            )
+        except Exception as e:
+            logger.error(f"[CALLBACK] Flask server failed: {e}")
+
+    t = threading.Thread(target=_run, name="callback-http", daemon=True)
+    t.start()
+    return t
 
 
 # --- 3. API FUNCTIONS ---
@@ -245,6 +738,14 @@ def api_deposit_add(user_id, amount):
         "confirm": confirm,
     }
 
+    print("\n" + "=" * 78)
+    print("💰 [DEPOSIT ADD → 1xBet]")
+    print("=" * 78)
+    print(f"URL   : {url}")
+    print(f"Body  : {format_json(body)}")
+    print(f"Sign  : {sign}")
+    print("-" * 78)
+
     try:
         r = requests.post(
             url,
@@ -259,10 +760,18 @@ def api_deposit_add(user_id, amount):
         )
     except requests.exceptions.RequestException as e:
         logger.error(f"[ADD] Network error: {e}")
+        print(f"❌ Network error: {e}")
+        print("=" * 78 + "\n")
         return {"success": False, "message": f"Network error: {e}", "http_status": 0}
     except Exception as e:
         logger.error(f"[ADD] Unexpected: {e}")
+        print(f"❌ Unexpected: {e}")
+        print("=" * 78 + "\n")
         return {"success": False, "message": f"Unexpected: {e}", "http_status": 0}
+
+    print(f"📥 HTTP {r.status_code}")
+    print(f"Body: {r.text[:600]}")
+    print("=" * 78 + "\n")
 
     logger.info(f"[ADD] URL: {url}")
     logger.info(f"[ADD] Body: {format_json(body)}")
@@ -286,9 +795,16 @@ def api_deposit_add(user_id, amount):
     message_id = data.get("messageId", data.get("MessageId"))
 
     duplicate_guard = False
-    if not success and isinstance(message, str):
-        if "уже был проведен" in message or message_id == 100337:
-            duplicate_guard = True
+    withdrawal_blocked = False
+    if not success:
+        if isinstance(message, str):
+            if "уже был проведен" in message or message_id == 100337:
+                duplicate_guard = True
+        if message_id == 100331:
+            withdrawal_blocked = True
+        elif isinstance(message, str):
+            if "подтвержденные запросы на вывод" in message or "пополнение невозможно" in message:
+                withdrawal_blocked = True
 
     return {
         "success": success,
@@ -296,6 +812,7 @@ def api_deposit_add(user_id, amount):
         "message": message,
         "message_id": message_id,
         "duplicate_guard": duplicate_guard,
+        "withdrawal_blocked": withdrawal_blocked,
         "http_status": r.status_code,
         "raw": data,
     }
@@ -403,7 +920,12 @@ async def verify_player_async(user_id):
 
 
 def api_create_order(payer_key, amount=1000, channel_id=35):
-    shop_order_id = f"ORD-{int(datetime.now().timestamp())}-{uuid.uuid4().hex[:4]}"
+    """
+    Create deposit order. The player ID is embedded inside ShopOrderId:
+        ORD-{player_id}-{ts}-{4hex}
+    """
+    shop_order_id = make_shop_order_id(payer_key)
+
     payload = {
         "Amount": int(amount),
         "CurrencyId": 11,
@@ -417,6 +939,17 @@ def api_create_order(payer_key, amount=1000, channel_id=35):
     }
     payload["EncryptValue"] = generate_encrypt_value(payload, MERCHANT_HASH_KEY)
     headers = {"accept": "application/json", "content-type": "application/json"}
+
+    print("\n" + "=" * 78)
+    print("💳 [CREATE ORDER]")
+    print("=" * 78)
+    print(f"URL            : {ORDER_API_URL}")
+    print(f"ShopOrderId    : {shop_order_id}")
+    print(f"  → Embedded   : player_id={payer_key}")
+    print(f"ShopInformUrl  : {MERCHANT_CALLBACK_URL}")
+    print(f"Body           : {format_json(payload)}")
+    print("-" * 78)
+
     try:
         response = requests.post(ORDER_API_URL, json=payload, headers=headers, timeout=15)
         try:
@@ -424,6 +957,10 @@ def api_create_order(payer_key, amount=1000, channel_id=35):
         except Exception:
             return {"Success": False,
                     "error_message": f"HTTP {response.status_code}\nRaw: {response.text}"}
+
+        print(f"📥 HTTP {response.status_code}  Body: {response.text[:500]}")
+        print("=" * 78 + "\n")
+
         if response.status_code == 200 and res_json.get("Success") is True:
             res_json["ShopOrderId"] = shop_order_id
             return res_json
@@ -536,16 +1073,16 @@ def api_payout(user_id, code):
         "confirm": confirm,
     }
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 78)
     print("💸 [PAYOUT REQUEST]")
-    print("=" * 70)
+    print("=" * 78)
     print(f"URL        : {url}")
     print(f"Step1 SHA  : {step1}")
     print(f"Step2 MD5  : {step2}")
     print(f"Signature  : {final_signature}")
     print(f"Confirm    : {confirm}")
     print(f"Body       : {format_json(body)}")
-    print("-" * 70)
+    print("-" * 78)
 
     try:
         r = requests.post(
@@ -562,18 +1099,18 @@ def api_payout(user_id, code):
     except requests.exceptions.RequestException as e:
         logger.error(f"[PAYOUT] Network error: {e}")
         print(f"❌ [PAYOUT] Network error: {e}")
-        print("=" * 70 + "\n")
+        print("=" * 78 + "\n")
         return {"success": False, "message": f"Network error: {e}", "http_status": 0}
     except Exception as e:
         logger.error(f"[PAYOUT] Unexpected: {e}")
         print(f"❌ [PAYOUT] Unexpected: {e}")
-        print("=" * 70 + "\n")
+        print("=" * 78 + "\n")
         return {"success": False, "message": f"Unexpected: {e}", "http_status": 0}
 
     print(f"📥 [PAYOUT RESPONSE]")
     print(f"HTTP Status: {r.status_code}")
     print(f"Raw Body   : {r.text}")
-    print("=" * 70 + "\n")
+    print("=" * 78 + "\n")
 
     logger.info(f"[PAYOUT] URL: {url}")
     logger.info(f"[PAYOUT] Body: {format_json(body)}")
@@ -645,7 +1182,7 @@ def api_create_payment_order(amount, channel_id, payee_name=None,
         "PayeeAccountNumber": str(payee_account or "01700000000"),
         "PayeePhoneNumber": str(payee_phone or DEFAULT_PAYEE_PHONE_NUMBER),
         "PaymentChannelId": int(channel_id),
-        "ShopInformUrl": "https://www.google.com",
+        "ShopInformUrl": MERCHANT_CALLBACK_URL.strip(),
         "ShopOrderId": str(shop_order_id),
         "ShopUserLongId": PAYOUT_SHOP_USER_LONG_ID,
     }
@@ -658,13 +1195,14 @@ def api_create_payment_order(amount, channel_id, payee_name=None,
         "Content-Type": "application/json",
     }
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 78)
     print(f"💳 [CREATE PAYMENT ORDER] channel={channel_id}")
-    print("=" * 70)
-    print(f"URL          : {PAYMENT_ORDER_API_URL}")
-    print(f"HashKey      : {PAYOUT_HASH_KEY}")
-    print(f"ShopUserLId  : {PAYOUT_SHOP_USER_LONG_ID}")
-    print(f"Body (json)  : {json_payload}")
+    print("=" * 78)
+    print(f"URL            : {PAYMENT_ORDER_API_URL}")
+    print(f"ShopInformUrl  : {MERCHANT_CALLBACK_URL}")
+    print(f"HashKey        : {PAYOUT_HASH_KEY}")
+    print(f"ShopUserLId    : {PAYOUT_SHOP_USER_LONG_ID}")
+    print(f"Body (json)    : {json_payload}")
 
     debug_kv = []
     for k in sorted(payload.keys()):
@@ -675,8 +1213,8 @@ def api_create_payment_order(amount, channel_id, payee_name=None,
             v = "true" if v else "false"
         debug_kv.append(f"{k}={v}")
     debug_kv.append(f"HashKey={PAYOUT_HASH_KEY.strip()}")
-    print(f"SignString   : {('&'.join(debug_kv)).lower()}")
-    print("-" * 70)
+    print(f"SignString     : {('&'.join(debug_kv)).lower()}")
+    print("-" * 78)
 
     try:
         response = requests.post(
@@ -688,7 +1226,7 @@ def api_create_payment_order(amount, channel_id, payee_name=None,
     except requests.exceptions.RequestException as e:
         logger.error(f"[PAYMENT_ORDER ch={channel_id}] Network error: {e}")
         print(f"❌ Network error: {e}")
-        print("=" * 70 + "\n")
+        print("=" * 78 + "\n")
         return {
             "Success": False,
             "channel_id": channel_id,
@@ -699,7 +1237,7 @@ def api_create_payment_order(amount, channel_id, payee_name=None,
     except Exception as e:
         logger.error(f"[PAYMENT_ORDER ch={channel_id}] Unexpected: {e}")
         print(f"❌ Unexpected: {e}")
-        print("=" * 70 + "\n")
+        print("=" * 78 + "\n")
         return {
             "Success": False,
             "channel_id": channel_id,
@@ -710,7 +1248,7 @@ def api_create_payment_order(amount, channel_id, payee_name=None,
 
     print(f"📥 Response HTTP {response.status_code}")
     print(f"Raw: {response.text[:800]}")
-    print("=" * 70 + "\n")
+    print("=" * 78 + "\n")
 
     logger.info(
         f"[PAYMENT_ORDER ch={channel_id}] Status: {response.status_code} Body: {response.text[:400]}"
@@ -789,14 +1327,13 @@ def get_main_keyboard():
 
 def get_settings_main_keyboard(is_admin=False):
     kb = [
-        [InlineKeyboardButton("🎮 1xBet ID", callback_data="set_1xbet_id"),
-         InlineKeyboardButton("💚 বিকাশ", callback_data="set_bkash")],
-        [InlineKeyboardButton("🧡 নগদ", callback_data="set_nagad"),
-         InlineKeyboardButton("💜 রকেট", callback_data="set_rocket")],
+        [InlineKeyboardButton("🎮 1xBet ID", callback_data="set_1xbet_id")],
     ]
     if is_admin:
-        kb.append([InlineKeyboardButton("💰 Check Balance", callback_data="check_balance"),
-                   InlineKeyboardButton("🔍 Find Player", callback_data="find_player")])
+        kb.append([
+            InlineKeyboardButton("💰 Check Balance", callback_data="check_balance"),
+            InlineKeyboardButton("🔍 Find Player", callback_data="find_player"),
+        ])
     return InlineKeyboardMarkup(kb)
 
 
@@ -849,9 +1386,12 @@ def get_withdraw_info_keyboard():
     ])
 
 
-def get_withdraw_channel_keyboard():
+def get_withdraw_channel_keyboard(exclude_ids=None):
+    exclude_ids = exclude_ids or set()
     kb = []
     for ch_id, ch_name, emoji in WITHDRAW_CHANNELS:
+        if ch_id in exclude_ids:
+            continue
         kb.append([InlineKeyboardButton(
             f"{emoji} {ch_name}",
             callback_data=f"wpick_ch_{ch_id}"
@@ -862,8 +1402,10 @@ def get_withdraw_channel_keyboard():
 
 def get_support_keyboard():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Message Support Agent ↗", url="https://t.me/ASMPAY"),
-        InlineKeyboardButton("Message Admin ↗", url="https://t.me/ASMPAYAdmin"),
+        InlineKeyboardButton(
+            "💬 Message Support on Telegram",
+            url=SUPPORT_LINK
+        ),
     ]])
 
 
@@ -904,7 +1446,6 @@ async def proceed_with_deposit_user(user_id, amount, update, context):
 
     context.user_data["state"] = "AWAITING_TXN_ID"
 
-    # ✅ BOLD multi-line instructions matching the screenshot
     dep_instructions = (
         "✅ **ডিপোজিট নির্দেশনা**\n\n"
         f"👤 **প্লেয়ার আইডি:** `{user_id}`\n"
@@ -933,7 +1474,7 @@ async def send_welcome_notice(update, context):
     notice_caption = (
         "🚀 **Onexbet - বট ব্যবহার করে মাত্র ৫ সেকেন্ডে ডিপোজিট** ⚡️\n\n"
         "💰 **মিন ডিপোজিট:** ১০০৳\n"
-        "💸 **মিন উইথড্র:** ৩০০৳\n"
+        "💸 **মিন উইথড্র:** ১৫০৳\n"
         "⏱️ **উইথড্র সময়:** মাত্র ৫ মিনিটের মধ্যেই ✅\n\n"
         "🤖 **অটো ডিপোজিট & অটো উইথড্র সাপোর্ট**\n"
         "📲 **সহজ, দ্রুত ও ঝামেলামুক্ত সার্ভিস**\n\n"
@@ -942,12 +1483,11 @@ async def send_welcome_notice(update, context):
         "📣 **মেনুয়াল👨‍💻👨‍💻 এবং রোবট👍👍 উভয় ডিপোজিট চালু রয়েছে🔥**\n\n"
         "📣 **যার যেভাবে ইচ্ছে করেন😱**\n\n"
         "    👇👇👇👇👇\n"
-        "👉 **@onexmanualbot** 👨‍💻 (মানুষ)\n"
-        "👉 **@onexbbbot** 👍👍 (রোবট)\n"
+        f"👉 **{SUPPORT_USERNAME}** 👨‍💻 (মানুষ)\n"
+        "👉 @onexbbbot 👍👍 (রোবট)\n"
         "         👆👆👆👆👆\n"
         "    **৫ সেকেন্ডে ডিপোজিট | উইথড্র**\n\n"
-        "📣 যদি @onexbbbot এ মেসেজ করে সমাধান না পান তখন কেবল আমাকে মেসেজ করবেন। "
-        "অকারণে মেসেজ করবেন না, আমি সব সময় লাইনে থাকি না।\n\n"
+        f"📣 💬 সার্বিক সহযোগিতার জন্য: প্রথমে আমাদের অফিসিয়াল সাপোর্ট গ্রুপ বা চ্যানেলে মেসেজ করুন 👉 {SUPPORT_USERNAME}\n\n"
         "📍 **ডিপোজিট বা উইথড্র করতে START বা নিচের বাটন চাপুন**\n"
         "💬 **২৪/৭ সাপোর্ট অ্যাক্টিভ**\n\n"
         "ধন্যবাদ 🙏✅"
@@ -992,7 +1532,6 @@ async def handle_message(update, context):
                                         reply_markup=get_deposit_options_keyboard())
         return
 
-    # ==================== WITHDRAW START ====================
     elif text == "📤 Withdraw":
         context.user_data["state"] = "AWAITING_PAYOUT_USER_ID"
         context.user_data.pop("payout_code", None)
@@ -1003,6 +1542,7 @@ async def handle_message(update, context):
         context.user_data.pop("withdraw_phone", None)
         context.user_data.pop("withdraw_channel_id", None)
         context.user_data.pop("withdraw_channel_name", None)
+        context.user_data["withdraw_failed_channels"] = []
         await update.message.reply_text(
             f"✦ **উত্তোলন** ✦\n\n"
             f"➤ **শহর:** `{WITHDRAW_CITY}`\n"
@@ -1016,17 +1556,31 @@ async def handle_message(update, context):
             reply_markup=ForceReply(selective=True),
         )
         return
+
     elif text == "🎁 Promo Code":
         context.user_data["state"] = None
-        await update.message.reply_text("🎁 **ASMPAY Promo Code** — Use **ASMPAY** 🚀",
-                                        parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🎁 **প্রোমো কোড:** `{PROMO_CODE}`\n\n"
+            f"এই কোডটি ডিপোজিটের সময় ব্যবহার করুন।",
+            parse_mode="Markdown",
+        )
         return
+
     elif text == "💬 Support":
         context.user_data["state"] = None
-        await update.message.reply_text("**ASMPAY Support**\n@ASMPAY | @ASMPAYAdmin",
-                                        parse_mode="Markdown",
-                                        reply_markup=get_support_keyboard())
+        try:
+            await update.message.reply_text(
+                SUPPORT_MESSAGE,
+                reply_markup=get_support_keyboard(),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await update.message.reply_text(
+                SUPPORT_MESSAGE,
+                disable_web_page_preview=True,
+            )
         return
+
     elif text in ["⚙️ Settings", "⚙ Settings", "⚙️ সেটিংস", "⚙ সেটিংস"]:
         context.user_data["state"] = None
         is_admin = str(update.effective_user.id) in ADMIN_USER_IDS
@@ -1034,7 +1588,6 @@ async def handle_message(update, context):
                                         reply_markup=get_settings_main_keyboard(is_admin=is_admin))
         return
 
-    # ---------- SAVE NEW PLAYER ID ----------
     if state == "AWAITING_SAVE_PLAYER_ID":
         v = await verify_player_async(text)
         if not v.get("valid"):
@@ -1053,7 +1606,6 @@ async def handle_message(update, context):
         await show_saved_ids_menu(update, context, message_text=msg)
         return
 
-    # ---------- DEPOSIT: USER ID INPUT ----------
     if state == "AWAITING_DEP_USER_ID":
         v = await verify_player_async(text)
         if not v.get("valid"):
@@ -1083,19 +1635,19 @@ async def handle_message(update, context):
         await proceed_with_deposit_user(uid, int(text), update, context)
         return
 
-    # ---------- TRANSACTION ID SUBMITTED ----------
     elif state == "AWAITING_TXN_ID":
         uid = context.user_data.get("dep_user_id")
         pn = context.user_data.get("dep_user_name")
         wallet = context.user_data.get("payment_method", "বিকাশ")
         soid = context.user_data.get("shop_order_id")
         amount = context.user_data.get("dep_amount", 0)
+        chat_id = update.effective_chat.id
 
         attempt = context.user_data.get("txn_attempts", 0) + 1
         context.user_data["txn_attempts"] = attempt
 
         loading = await update.message.reply_text(
-            f"⏳ যাচাই করা হচ্ছে...",
+            "⏳ যাচাই করা হচ্ছে...",
             parse_mode="Markdown",
         )
 
@@ -1111,54 +1663,33 @@ async def handle_message(update, context):
         )
 
         if is_success:
-            add_loading = await update.message.reply_text(
-                "💳 **প্লেয়ার একাউন্টে ফান্ড অ্যাড করা হচ্ছে...**",
-                parse_mode="Markdown",
+            # Register pending so we can also notify the user on callback.
+            register_pending_deposit(
+                shop_order_id=soid,
+                chat_id=chat_id,
+                user_id=uid,
+                name=pn,
+                amount=int(amount),
+                wallet=wallet,
+                trxid=text,
+            )
+
+            final_text = (
+                f"{response_text}\n\n"
+                f"⏳ **পেমেন্ট যাচাই করা হচ্ছে...**\n"
+                f"মার্চেন্ট কনফার্মেশন পেলে আমরা আপনার একাউন্টে ফান্ড অ্যাড করে দিব ইনশাআল্লাহ।\n"
+                f"_(সাধারণত ১০ সেকেন্ড থেকে ১ মিনিট সময় লাগতে পারে)_"
             )
 
             try:
-                add_res = await asyncio.to_thread(api_deposit_add, uid, int(amount))
-            except Exception as e:
-                add_res = {"success": False, "message": f"Exception: {e}"}
-
-            add_ok = bool(add_res.get("success"))
-            dup = bool(add_res.get("duplicate_guard"))
-            add_msg = add_res.get("message") or ""
-            add_summa = add_res.get("summa")
-
-            if add_ok:
-                final_text = (
-                    f"{response_text}\n\n"
-                    f"💰 **ফান্ড অ্যাড সফল!**\n"
-                    f"➤ অ্যামাউন্ট: `{add_summa if add_summa is not None else amount}` BDT"
-                )
-            elif dup:
-                final_text = (
-                    f"{response_text}\n\n"
-                    f"⚠️ **এই ডিপোজিট আগেই প্লেয়ার একাউন্টে অ্যাড হয়েছে।**\n"
-                    f"➤ মেসেজ: `{add_msg}`"
-                )
-            else:
-                final_text = (
-                    f"{response_text}\n\n"
-                    f"❌ **ফান্ড অ্যাড ব্যর্থ!**\n"
-                    f"➤ মেসেজ: `{add_msg or 'Unknown error'}`\n\n"
-                    f"অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।"
-                )
-
-            try:
-                await add_loading.edit_text(final_text, parse_mode="Markdown")
+                await loading.edit_text(final_text, parse_mode="Markdown")
             except Exception:
                 await update.message.reply_text(final_text, parse_mode="Markdown")
 
             context.user_data["state"] = None
             context.user_data.pop("txn_attempts", None)
             context.user_data.pop("shop_order_id", None)
-
-            try:
-                await loading.delete()
-            except Exception:
-                pass
+            return
 
         elif content in TERMINAL_TRX_ERRORS:
             context.user_data["state"] = None
@@ -1188,7 +1719,6 @@ async def handle_message(update, context):
             )
         return
 
-    # ==================== WITHDRAW: STEP 1 — PLAYER ID ====================
     elif state == "AWAITING_PAYOUT_USER_ID":
         v = await verify_player_async(text)
         if not v.get("valid"):
@@ -1216,7 +1746,6 @@ async def handle_message(update, context):
         )
         return
 
-    # ==================== WITHDRAW: STEP 2 — SECRET CODE VERIFICATION ====================
     elif state == "AWAITING_PAYOUT_CODE":
         code = text.strip()
         if not code:
@@ -1244,7 +1773,6 @@ async def handle_message(update, context):
             parse_mode="Markdown",
         )
 
-        # ---------- STEP A: CashdeskBotAPI payout ----------
         try:
             data = await asyncio.to_thread(api_payout, uid, code)
         except Exception as e:
@@ -1264,7 +1792,6 @@ async def handle_message(update, context):
             f"🔑 **কোড:** `{code}`"
         )
 
-        # ============ ❌ PAYOUT FAILED → SHOW ERROR, RETRY CODE ============
         if not success:
             if api_success and raw_summa is not None and raw_summa >= 0:
                 reason_bn = (
@@ -1273,12 +1800,6 @@ async def handle_message(update, context):
                 )
             else:
                 reason_bn = translate_payout_error(message, message_id)
-
-            raw_debug = ""
-            if message:
-                raw_debug = f"\n\n🔧 _raw: {message}_"
-                if message_id is not None:
-                    raw_debug += f" _(code {message_id})_"
 
             final_text = (
                 f"{base_info}\n\n"
@@ -1299,13 +1820,13 @@ async def handle_message(update, context):
             )
             return
 
-        # ============ ✅ PAYOUT OK → STORE AMOUNT, ASK PHONE NUMBER ============
         payout_amount = int(paid_amount) if paid_amount is not None else 0
 
         context.user_data["withdraw_payout_amount"] = payout_amount
         context.user_data["withdraw_payout_op_id"] = operation_id or str(raw_summa)
         context.user_data["payout_code"] = code
         context.user_data["state"] = "AWAITING_WITHDRAW_PHONE"
+        context.user_data["withdraw_failed_channels"] = []
 
         try:
             await loading.edit_text(
@@ -1318,7 +1839,6 @@ async def handle_message(update, context):
         except Exception:
             pass
 
-        # Ask for phone number
         await update.message.reply_text(
             f"📱 **পেআউট নম্বর লিখুন**\n\n"
             f"যে বিকাশ / নগদ / রকেট নম্বরে টাকা পেতে চান, সেই নম্বরটি লিখুন:\n"
@@ -1328,7 +1848,6 @@ async def handle_message(update, context):
         )
         return
 
-    # ==================== WITHDRAW: STEP 3 — PHONE NUMBER ====================
     elif state == "AWAITING_WITHDRAW_PHONE":
         phone = text.strip().replace(" ", "").replace("-", "")
         if not phone.isdigit() or len(phone) < 10 or len(phone) > 14:
@@ -1395,13 +1914,18 @@ async def button_click(update, context):
             await q.answer("❌ ভুল চ্যানেল।", show_alert=True)
             return
 
+        failed_channels = context.user_data.get("withdraw_failed_channels", []) or []
+        if ch_id in failed_channels:
+            await q.answer("⚠️ এই চ্যানেল আগেই ব্যর্থ হয়েছে। অন্যটি বেছে নিন।", show_alert=True)
+            return
+
         ch_name = "N/A"
         for cid, cname, _ in WITHDRAW_CHANNELS:
             if cid == ch_id:
                 ch_name = cname
                 break
 
-        await q.answer(f"✅ {ch_name} নির্বাচিত")
+        await q.answer(f"⏳ {ch_name} প্রসেস করা হচ্ছে...")
 
         uid = context.user_data.get("payout_user_id")
         uname = context.user_data.get("payout_user_name", "N/A")
@@ -1409,8 +1933,6 @@ async def button_click(update, context):
         amount = context.user_data.get("withdraw_payout_amount", 0)
         op_id = context.user_data.get("withdraw_payout_op_id", "N/A")
         phone = context.user_data.get("withdraw_phone", "")
-
-        context.user_data["state"] = None
 
         loading = await q.message.reply_text(
             f"⏳ **পেমেন্ট অর্ডার তৈরি করা হচ্ছে ({ch_name})...**",
@@ -1454,24 +1976,12 @@ async def button_click(update, context):
                 f"━━━━━━━━━━━━━━━━━\n"
                 f"⏱️ টাকা অল্প সময়ের মধ্যেই আপনার নম্বরে পৌঁছে যাবে।"
             )
-        else:
-            final_text = (
-                f"{base_info}\n\n"
-                f"⚠️ **১xBet পেআউট সফল কিন্তু Payment Order ব্যর্থ!**\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"💵 **অ্যামাউন্ট:** `{amount_txt}`\n"
-                f"🆔 **Payout Op ID:** `{op_id}`\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"❌ **Payment Order Error:** `{po_err[:250]}`\n\n"
-                f"📞 সাপোর্টে যোগাযোগ করুন (@ASMPAY)।"
-            )
 
-        try:
-            await loading.edit_text(final_text, parse_mode="Markdown")
-        except Exception:
-            await q.message.reply_text(final_text, parse_mode="Markdown")
+            try:
+                await loading.edit_text(final_text, parse_mode="Markdown")
+            except Exception:
+                await q.message.reply_text(final_text, parse_mode="Markdown")
 
-        if po_ok:
             bal = await asyncio.to_thread(api_balance)
             if "error" not in bal:
                 b = bal.get("Balance")
@@ -1490,11 +2000,80 @@ async def button_click(update, context):
                 except Exception:
                     pass
 
-        context.user_data.pop("payout_code", None)
-        context.user_data.pop("withdraw_payout_amount", None)
-        context.user_data.pop("withdraw_payout_op_id", None)
-        context.user_data.pop("withdraw_phone", None)
-        return
+            context.user_data["state"] = None
+            context.user_data.pop("payout_code", None)
+            context.user_data.pop("withdraw_payout_amount", None)
+            context.user_data.pop("withdraw_payout_op_id", None)
+            context.user_data.pop("withdraw_phone", None)
+            context.user_data.pop("withdraw_failed_channels", None)
+            return
+
+        if ch_id not in failed_channels:
+            failed_channels.append(ch_id)
+        context.user_data["withdraw_failed_channels"] = failed_channels
+
+        reason_bn = translate_payment_order_error(po_err)
+        remaining = [c for c in WITHDRAW_CHANNELS if c[0] not in failed_channels]
+
+        raw_debug = f"\n\n🔧 _raw: `{po_err[:200]}`_" if po_err else ""
+
+        if remaining:
+            remaining_lines = "\n".join(
+                [f"• {emoji} {name}" for _, name, emoji in remaining]
+            )
+            retry_text = (
+                f"{base_info}\n\n"
+                f"❌ **পেমেন্ট অর্ডার ব্যর্থ!**\n"
+                f"➤ কারণ: {reason_bn}"
+                f"{raw_debug}\n\n"
+                f"💡 **অন্য একটি পেমেন্ট চ্যানেল বেছে নিন:**\n"
+                f"{remaining_lines}"
+            )
+
+            context.user_data["state"] = "AWAITING_WITHDRAW_CHANNEL"
+
+            try:
+                await loading.edit_text(
+                    retry_text,
+                    parse_mode="Markdown",
+                    reply_markup=get_withdraw_channel_keyboard(
+                        exclude_ids=set(failed_channels)
+                    ),
+                )
+            except Exception:
+                await q.message.reply_text(
+                    retry_text,
+                    parse_mode="Markdown",
+                    reply_markup=get_withdraw_channel_keyboard(
+                        exclude_ids=set(failed_channels)
+                    ),
+                )
+            return
+        else:
+            final_text = (
+                f"{base_info}\n\n"
+                f"❌ **সব পেমেন্ট চ্যানেলই ব্যর্থ হয়েছে!**\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"💵 **অ্যামাউন্ট:** `{amount_txt}`\n"
+                f"🆔 **Payout Op ID:** `{op_id}`\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"➤ শেষ কারণ: {reason_bn}"
+                f"{raw_debug}\n\n"
+                f"📞 **অনুগ্রহ করে সাপোর্টে যোগাযোগ করুন ({SUPPORT_USERNAME})।**"
+            )
+
+            try:
+                await loading.edit_text(final_text, parse_mode="Markdown")
+            except Exception:
+                await q.message.reply_text(final_text, parse_mode="Markdown")
+
+            context.user_data["state"] = None
+            context.user_data.pop("payout_code", None)
+            context.user_data.pop("withdraw_payout_amount", None)
+            context.user_data.pop("withdraw_payout_op_id", None)
+            context.user_data.pop("withdraw_phone", None)
+            context.user_data.pop("withdraw_failed_channels", None)
+            return
 
     elif q.data == "withdraw_cancel":
         await q.answer("বাতিল করা হয়েছে")
@@ -1507,6 +2086,7 @@ async def button_click(update, context):
         context.user_data.pop("withdraw_phone", None)
         context.user_data.pop("withdraw_channel_id", None)
         context.user_data.pop("withdraw_channel_name", None)
+        context.user_data.pop("withdraw_failed_channels", None)
         await q.message.reply_text(
             "❌ **উইথড্র বাতিল করা হয়েছে।**\n\nআবার শুরু করতে 📤 Withdraw বাটনে চাপুন।",
             parse_mode="Markdown",
@@ -1655,11 +2235,22 @@ async def button_click(update, context):
 
 # --- 10. POST INIT ---
 async def post_init(application):
+    global telegram_app
+    telegram_app = application
     await application.bot.set_my_commands([BotCommand("start", "রোবট শুরু করুন🥳")])
 
 
 # --- 11. MAIN ---
 if __name__ == "__main__":
+    print("=" * 78)
+    print("🚀 Bot starting...")
+    print(f"🌐 Callback URL (as sent to merchant): {MERCHANT_CALLBACK_URL}")
+    print(f"🌐 Local callback server listening on : http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}")
+    print("=" * 78)
+
+    start_flask_in_background()
+    time.sleep(0.5)
+
     persistence = PicklePersistence(filepath="bot_data.pickle")
     app = (
         ApplicationBuilder()
